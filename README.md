@@ -1,4 +1,4 @@
-# File Upload Helper — Burp Suite Extension
+# File Uploader — Burp Suite Extension
 
 A Burp Suite Jython 2.7 extension for injecting, encoding, signing, and encrypting arbitrary file content into HTTP requests directly from Repeater, Intruder, or Proxy. 
 
@@ -11,8 +11,8 @@ Designed for penetration testers testing file upload endpoints, HMAC-signed APIs
 **Requirements:** Burp Suite (any edition) and Jython Standalone 2.7.x.
 
 1. In Burp, go to `Extender` → `Options` → `Python Environment` and set the path to your `jython-standalone-2.7.x.jar`.
-2. Go to `Extender` → `Extensions` → `Add`, set Extension Type to `Python`, and select `FileUploadHelper.py`.
-3. Click `Next`. The output panel should show `[*] File Upload Helper loaded.`
+2. Go to `Extender` → `Extensions` → `Add`, set Extension Type to `Python`, and select `FileUploader.py`.
+3. Click `Next`. The output panel should show `[*] File Uploader loaded.`
 
 ---
 
@@ -20,7 +20,7 @@ Designed for penetration testers testing file upload endpoints, HMAC-signed APIs
 
 1. Open a request in Repeater, Intruder, or Proxy.
 2. Select the text you want to replace in the editor.
-3. Right-click → `Extensions` → `File Upload Helper`.
+3. Right-click → `Extensions` → `File Uploader`.
 4. In the dialog, browse for a file or pick an EICAR preset, choose an encoding mode, fill in key/IV if required, and click `Apply Replacement`.
 
 A selection is required. If nothing is selected when the menu item is clicked, the extension shows a warning and does nothing.
@@ -59,3 +59,4 @@ The `TOOL_REPEATER`, `TOOL_INTRUDER`, and `TOOL_PROXY` constants are resolved fr
 ## Disclaimer
 
 This tool is intended for authorized security testing only. Use it only on systems you have explicit permission to test. The EICAR test files embedded in the extension are harmless detection-test strings, not real malware.
++
