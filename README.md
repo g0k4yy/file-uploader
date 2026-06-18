@@ -48,14 +48,6 @@ Toggle individual algorithms using the buttons at the top. SHA-3 and BLAKE2 vari
 
 ---
 
-## Compatibility Notes
-
-The extension uses `javax.crypto` for AES operations and `java.security.SecureRandom` for IV generation, both of which are always available on the JVM. A `jarray`-based workaround is in place to ensure `SecureRandom.nextBytes()` writes into the actual Java `byte[]` rather than a Jython-side copy that would silently remain zeroed. IV hex-parsing uses `binascii.unhexlify` instead of `bytes.fromhex()` for Jython 2.7 compatibility.
-
-The `TOOL_REPEATER`, `TOOL_INTRUDER`, and `TOOL_PROXY` constants are resolved from `IContextMenuInvocation` at the class level rather than the instance level, which fixes a crash on Burp Suite 2.x where those attributes were removed from the invocation object.
-
----
-
 ## Disclaimer
 
 This tool is intended for authorized security testing only. Use it only on systems you have explicit permission to test. The EICAR test files embedded in the extension are harmless detection-test strings, not real malware.
