@@ -58,7 +58,6 @@ _MAGIC = [
     (0, b'\x89PNG\r\n\x1a\n',     u"image/png"),
     (0, b'GIF87a',                 u"image/gif"),
     (0, b'GIF89a',                 u"image/gif"),
-    (0, b'RIFF',                   u"image/webp"),   # refined below
     (0, b'BM',                     u"image/bmp"),
     (0, b'\x00\x00\x01\x00',       u"image/x-icon"),
     (0, b'%PDF-',                  u"application/pdf"),
@@ -106,9 +105,18 @@ def _detect_mime(file_bytes, filename=None):
     """
     if file_bytes and len(file_bytes) >= 4:
         head = bytes(bytearray(file_bytes[:16]))
-        # WEBP special case: RIFF????WEBP
-        if head[:4] == b'RIFF' and len(head) >= 12 and head[8:12] == b'WEBP':
-            return u"image/webp"
+        # RIFF container: the subtype at bytes 8..12 decides the real format.
+        # A bare "RIFF" prefix is NOT enough — WAV/AVI/WEBP all share it, so the
+        # old code mislabelled WAV/AVI as image/webp. Resolve the subtype here and
+        # let any unknown RIFF fall through to the extension / octet-stream logic.
+        if head[:4] == b'RIFF' and len(head) >= 12:
+            riff_sub = head[8:12]
+            if riff_sub == b'WEBP':
+                return u"image/webp"
+            elif riff_sub == b'WAVE':
+                return u"audio/wav"
+            elif riff_sub == b'AVI ':
+                return u"video/x-msvideo"
         for offset, magic, mime in _MAGIC:
             end = offset + len(magic)
             if head[offset:end] == magic:
@@ -262,33 +270,6 @@ def encode_content(raw_bytes, mode, key=None, iv=None):
     return bytearray(raw_bytes)
 
 
-def compute_hashes(raw_bytes):
-    """Return ordered list of (algo_name, hexdigest) for display."""
-    data = bytes(bytearray(raw_bytes))
-    results = [
-        ('MD5',       hashlib.md5(data).hexdigest()),
-        ('SHA1',      hashlib.sha1(data).hexdigest()),
-        ('SHA224',    hashlib.sha224(data).hexdigest()),
-        ('SHA256',    hashlib.sha256(data).hexdigest()),
-        ('SHA384',    hashlib.sha384(data).hexdigest()),
-        ('SHA512',    hashlib.sha512(data).hexdigest()),
-    ]
-    # SHA3 variants — available in Python 3 / Jython 2.7.x (best-effort)
-    for algo, attr in [('SHA3-224', 'sha3_224'), ('SHA3-256', 'sha3_256'),
-                        ('SHA3-384', 'sha3_384'), ('SHA3-512', 'sha3_512')]:
-        try:
-            results.append((algo, getattr(hashlib, attr)(data).hexdigest()))
-        except AttributeError:
-            pass
-    # BLAKE2 — Python 3.6+ / may not be present on all Jython builds
-    for algo, attr in [('BLAKE2b', 'blake2b'), ('BLAKE2s', 'blake2s')]:
-        try:
-            results.append((algo, getattr(hashlib, attr)(data).hexdigest()))
-        except (AttributeError, TypeError):
-            pass
-    return results
-
-
 _ALL_HASH_ALGOS = [
     'MD5', 'SHA1', 'SHA224', 'SHA256', 'SHA384', 'SHA512',
     'SHA3-224', 'SHA3-256', 'SHA3-384', 'SHA3-512',
@@ -318,11 +299,12 @@ class ReplaceDialog(JDialog):
       [Hash Calculator]  MD5 / SHA1 / SHA256 / SHA512 of the loaded file
     """
 
-    def __init__(self, parent_frame, selected_text):
+    def __init__(self, parent_frame, selected_text, callbacks=None):
         JDialog.__init__(self, parent_frame, u"File Uploader", True)
         self._result        = None   # (raw_bytes, mode_idx, key, iv) or None
         self._file_bytes    = None
         self._selected_text = selected_text
+        self._callbacks     = callbacks   # Burp callbacks — enables native text editors
         self._build(parent_frame)
 
     # ── Top-level layout ───────────────────────────────────────────────────
@@ -350,8 +332,82 @@ class ReplaceDialog(JDialog):
 
         self.setContentPane(outer)
         self.pack()
+        # Belt-and-suspenders: a pathological preferred size (e.g. a huge unwrapped
+        # selection) shouldn't push the dialog past the screen edges. Cap pack()'s
+        # result to 90% of the screen, keeping the 640x580 floor.
+        from java.awt import Toolkit
+        screen = Toolkit.getDefaultToolkit().getScreenSize()
+        packed = self.getSize()
+        self.setSize(Dimension(
+            max(640, min(packed.width,  int(screen.width  * 0.9))),
+            max(580, min(packed.height, int(screen.height * 0.9)))))
         self.setMinimumSize(Dimension(640, 580))
         self.setLocationRelativeTo(parent)
+
+    # ── Native text view helper ────────────────────────────────────────────
+
+    def _make_text_view(self, editable=False, pref_size=None):
+        """
+        Build a text view for arbitrary content.
+
+        Prefers Burp's native ITextEditor (callbacks.createTextEditor()) so the
+        field matches the rest of Burp's UI (search bar, context menu, fonts,
+        hex/raw toggle).  Returns (component_to_add, set_text_fn).
+
+        `pref_size` is an optional (width, height) in pixels. It bounds the
+        component's preferred size so a very long, unwrapped selection can't drive
+        pack() and stretch the dialog — the content scrolls inside the fixed box
+        instead. A small minimum keeps GridBag from collapsing it.
+
+        Falls back to a plain JTextArea wrapped in a JScrollPane if callbacks are
+        unavailable (e.g. the dialog is opened outside Burp for testing), so the
+        dialog still works everywhere.
+        """
+        if self._callbacks is not None:
+            try:
+                editor = self._callbacks.createTextEditor()
+                editor.setEditable(editable)
+                comp = editor.getComponent()
+                if pref_size is not None:
+                    comp.setPreferredSize(Dimension(pref_size[0], pref_size[1]))
+                    comp.setMinimumSize(Dimension(120, 40))
+                def _set(text):
+                    # ITextEditor.setText() expects a byte[]; encode unicode as UTF-8.
+                    editor.setText((text or u"").encode('utf-8'))
+                return comp, _set
+            except Exception:
+                pass
+        # Fallback: plain Swing text area
+        ta = JTextArea(u"", 4, 52)
+        ta.setEditable(editable)
+        ta.setFont(Font("Monospaced", Font.PLAIN, 10))
+        ta.setLineWrap(True)
+        ta.setWrapStyleWord(True)
+        sp = JScrollPane(ta)
+        if pref_size is not None:
+            sp.setPreferredSize(Dimension(pref_size[0], pref_size[1]))
+            sp.setMinimumSize(Dimension(120, 40))
+        def _set(text):
+            ta.setText(text or u"")
+        return sp, _set
+
+    # ── Button-label reset helper ──────────────────────────────────────────
+
+    def _reset_button_later(self, button, text, delay_ms=1500):
+        """
+        Restore a button's label after `delay_ms`, on the EDT.
+
+        Uses javax.swing.Timer instead of a background thread + time.sleep:
+        the Timer's callback already fires on the Event Dispatch Thread, so
+        setText() is Swing-safe without an explicit invokeLater hop, and there's
+        no stray daemon thread left running.
+        """
+        from javax.swing import Timer
+        def _reset(e):
+            button.setText(text)
+        t = Timer(delay_ms, _wrap_listener(_reset))
+        t.setRepeats(False)
+        t.start()
 
     # ── Inject File tab ────────────────────────────────────────────────────
 
@@ -376,14 +432,18 @@ class ReplaceDialog(JDialog):
 
         gbc.gridy, gbc.weighty = R(), 0.25
         gbc.fill = GridBagConstraints.BOTH
-        sel_preview = JTextArea(
-            self._selected_text[:300] if self._selected_text else u"(nothing selected)", 3, 52)
-        sel_preview.setEditable(False)
-        sel_preview.setFont(Font("Monospaced", Font.PLAIN, 10))
-        sel_preview.setBackground(Color(245, 245, 220))
-        sel_preview.setLineWrap(True)
-        sel_preview.setWrapStyleWord(True)
-        center.add(JScrollPane(sel_preview), gbc)
+        # Native Burp editor with a bounded size: a very long selection scrolls
+        # inside the box instead of stretching the dialog. The preview text itself
+        # is capped, with a note showing the true length.
+        sel_component, sel_set = self._make_text_view(editable=False, pref_size=(600, 70))
+        _sel_txt = self._selected_text or u""
+        if len(_sel_txt) > 300:
+            _sel_txt = _sel_txt[:300] + u"\n… [{} chars selected — preview truncated]".format(
+                len(self._selected_text))
+        elif not _sel_txt:
+            _sel_txt = u"(nothing selected)"
+        sel_set(_sel_txt)
+        center.add(sel_component, gbc)
         gbc.weighty = 0.0
         gbc.fill = GridBagConstraints.HORIZONTAL
 
@@ -498,13 +558,10 @@ class ReplaceDialog(JDialog):
 
         gbc.gridy, gbc.weighty = R(), 0.4
         gbc.fill = GridBagConstraints.BOTH
-        self._preview_area = JTextArea(u"", 4, 52)
-        self._preview_area.setEditable(False)
-        self._preview_area.setFont(Font("Monospaced", Font.PLAIN, 10))
-        self._preview_area.setBackground(Color(230, 255, 230))
-        self._preview_area.setLineWrap(True)
-        self._preview_area.setWrapStyleWord(False)
-        center.add(JScrollPane(self._preview_area), gbc)
+        # Native Burp editor for the encoded/encrypted output preview (bounded size).
+        self._preview_component, self._preview_set = self._make_text_view(
+            editable=False, pref_size=(600, 140))
+        center.add(self._preview_component, gbc)
         gbc.weighty = 0.0
         gbc.fill = GridBagConstraints.HORIZONTAL
 
@@ -660,12 +717,7 @@ class ReplaceDialog(JDialog):
                         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
                             StringSelection(val), None)
                         self._hash_copy_btns[a].setText(u"\u2713 Copied")
-                        import threading
-                        def _reset():
-                            import time; time.sleep(1.5)
-                            SwingUtilities.invokeLater(
-                                lambda: self._hash_copy_btns[a].setText(u"Copy"))
-                        threading.Thread(target=_reset).start()
+                        self._reset_button_later(self._hash_copy_btns[a], u"Copy")
                 return _copy
             copy_btn.addActionListener(_wrap_listener(_make_copy_fn(algo)))
             self._hash_copy_btns[algo] = copy_btn
@@ -691,15 +743,27 @@ class ReplaceDialog(JDialog):
     def _on_browse(self, event):
         chooser = JFileChooser()
         chooser.setDialogTitle(u"Select file to inject")
-        if chooser.showOpenDialog(self) == JFileChooser.APPROVE_OPTION:
-            f    = chooser.getSelectedFile()
-            path = f.getAbsolutePath()
-            self._path_field.setText(path)
+        if chooser.showOpenDialog(self) != JFileChooser.APPROVE_OPTION:
+            return
+        f    = chooser.getSelectedFile()
+        path = f.getAbsolutePath()
+        # Read inside try/except so an unreadable file (permissions, lock, gone)
+        # surfaces as a dialog instead of an uncaught stack trace on the EDT.
+        try:
             with open(path, 'rb') as fh:
                 self._file_bytes = bytearray(fh.read())
-            self._preview_area.setText(u"")
-            self._preset_combo.setSelectedIndex(0)
-            self._ct_field.setText(_detect_mime(self._file_bytes, f.getName()))
+        except Exception as ex:
+            JOptionPane.showMessageDialog(
+                self,
+                u"Could not read the selected file:\n{}".format(str(ex)),
+                u"Read error",
+                JOptionPane.ERROR_MESSAGE)
+            return
+        # Only update UI state after a successful read.
+        self._path_field.setText(path)
+        self._preview_set(u"")
+        self._preset_combo.setSelectedIndex(0)
+        self._ct_field.setText(_detect_mime(self._file_bytes, f.getName()))
 
     def _on_preset_selected(self, event):
         label = self._preset_combo.getSelectedItem()
@@ -708,7 +772,7 @@ class ReplaceDialog(JDialog):
         filename, b64 = _EICAR_PRESETS[label]
         self._file_bytes = bytearray(base64.b64decode(b64))
         self._path_field.setText(u"[Preset] " + filename)
-        self._preview_area.setText(u"")
+        self._preview_set(u"")
         self._ct_field.setText(_detect_mime(self._file_bytes, filename))
 
     def _on_enc_changed(self, event):
@@ -749,11 +813,7 @@ class ReplaceDialog(JDialog):
             Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
                 StringSelection(val), None)
             self._ct_copy_btn.setText(u"Copied!")
-            import threading
-            def _reset():
-                import time; time.sleep(1.5)
-                SwingUtilities.invokeLater(lambda: self._ct_copy_btn.setText(u"Copy"))
-            threading.Thread(target=_reset).start()
+            self._reset_button_later(self._ct_copy_btn, u"Copy")
 
     def _on_gen_iv(self, event):
         """Fill IV field with a freshly generated random value (hex)."""
@@ -788,9 +848,9 @@ class ReplaceDialog(JDialog):
                     u"\u2026" if len(result) > 512 else u"")
             else:
                 display = result[:512] + (u"\u2026" if len(result) > 512 else u"")
-            self._preview_area.setText(display)
+            self._preview_set(display)
         except Exception as ex:
-            self._preview_area.setText(u"Error: " + str(ex))
+            self._preview_set(u"Error: " + str(ex))
 
     def _on_calc_hashes(self, event):
         if self._file_bytes is None:
@@ -999,7 +1059,7 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         except AttributeError:
             pass
 
-        dlg = ReplaceDialog(frame, selected_text)
+        dlg = ReplaceDialog(frame, selected_text, self._callbacks)
         dlg.setVisible(True)   # modal — blocks
 
         result = dlg.get_result()
@@ -1007,7 +1067,18 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             return
 
         raw_bytes, mode_idx, key, iv = result
-        encoded   = encode_content(raw_bytes, mode_idx, key=key, iv=iv)
+        # Guard the encode step: a bad hex IV or a crypto failure should become a
+        # user-facing dialog, not a silent stack trace in the Burp output pane.
+        try:
+            encoded = encode_content(raw_bytes, mode_idx, key=key, iv=iv)
+        except Exception as ex:
+            JOptionPane.showMessageDialog(
+                frame,
+                u"Encoding / encryption failed:\n{}".format(str(ex)),
+                u"Encode error",
+                JOptionPane.ERROR_MESSAGE)
+            self._log(u"Encode failed: {}".format(str(ex)))
+            return
         is_binary = isinstance(encoded, (bytes, bytearray))
 
         if is_binary:
